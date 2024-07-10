@@ -1,0 +1,4 @@
+wandb/
+lightning_logs/
+preds/
+__pycache__/

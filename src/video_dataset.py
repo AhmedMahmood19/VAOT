@@ -64,9 +64,13 @@ class VideoDataset(Dataset):
         video_fname = self.video_fnames[idx]
         # Load that vid's groundTruth file, convert it into a list of action-classes
         gt = [line.rstrip() for line in open(path.join(self.data_dir, 'groundTruth', video_fname))]
-        # For data_test, inds=[0,1,...,len(gt)-1], mask=array of length len(gt) where each element is True 
+
+        # __getitem__ is supposed to return the features and labels corresponding to the frames in a video, 
+        # but we don't always want to use all the frames in the video so we would sample some amount of frames
+        # __getitem__ calls this function to determine exactly what frames from the video will we use
         inds, mask = self._partition_and_sample(self.n_frames, len(gt))
-        # Converts the list of action-classes into a PyTorch tensor of action-ids.
+        # We will use inds to store the features and gt for only the sampled frames
+        # Converts the list of action-classes into a PyTorch tensor of action-ids, filtered by inds.
         # Now ground truth is represented by a tensor of longs
         gt = torch.Tensor([self.action_mapping[gt[ind]] for ind in inds]).long()
         action = parse_action_name(video_fname, self.dataset)
@@ -86,22 +90,39 @@ class VideoDataset(Dataset):
             features[zmask] = z
             features = np.nan_to_num(features)
             features /= np.sqrt(features.shape[1])
-        # mask = torch.from_numpy(mask * zmask)
         features = torch.from_numpy(features).float()
         return features, mask, gt, video_fname, gt.unique().shape[0]
     
+    # Receives: how many frames are there in the video(n_frames) and how many frames would we like to sample from the video(n_samples)
+    #           and should we perform random sampling(self.random)
+    # Returns: the indices of the frames to use(indices), which of the frames are unique???TODO???(True) and which are padding(False) (mask).
+    # NOTE: For all conditions except first, len(indices)==len(mask)==n_samples.
     def _partition_and_sample(self, n_samples, n_frames):
+        # This condition is used for test, where n_samples=None, meaning use all the frames in the video
         if n_samples is None:
+            # Values are [0 to n_frames-1]
             indices = np.arange(n_frames)
+            # All values are True
             mask = np.full(n_frames, 1, dtype=bool)
+        
+        # These conditions are used for train/val, where n_samples=args.n_frames(default 256)
+        # If no. of samples required < no. of frames in the video
         elif n_samples < n_frames:
+            # If random sampling, indices will be filled with n_samples random indices from [0 to n_frames-1]  
             if self.random:
                 boundaries = np.linspace(0, n_frames-1, n_samples+1).astype(int)
                 indices = np.random.randint(low=boundaries[:-1], high=boundaries[1:])
+            # Else, indices will be filled with n_samples evenly spaced indices from [0 to n_frames-1]
             else:
                 indices = np.linspace(0, n_frames-1, n_samples).astype(int)
+            # All values are True
             mask = np.full(n_samples, 1, dtype=bool)
+        
+        # If no. of samples required >= no. of frames in the video
         else:
+            # First n_frames values are [0 to n_frames-1] and remaining values(if any) are n_frames-1
             indices = np.concatenate((np.arange(n_frames), np.full(n_samples - n_frames, n_frames - 1)))
+            # First n_frames values are True and remaining values(if any) are False
             mask = np.concatenate((np.full(n_frames, 1, dtype=bool), np.zeros(n_samples - n_frames, dtype=bool)))
+        
         return indices, mask

@@ -60,10 +60,12 @@ class VideoSSL(pl.LightningModule):
         layers += [nn.Linear(layer_sizes[-2], layer_sizes[-1])]
         self.mlp = nn.Sequential(*layers)
 
+        #TODO: Don't need clusters anymore since we're removing action embeddings
         # initialize cluster centers/codebook
         d = self.layer_sizes[-1]
         self.clusters = nn.parameter.Parameter(data=F.normalize(torch.randn(self.n_clusters, d), dim=-1), requires_grad=learn_clusters)
 
+        #TODO: Need to replace with evaluation metrics for video alignment
         # initialize evaluation metrics
         self.mof = ClusteringMetrics(metric='mof')
         self.f1 = ClusteringMetrics(metric='f1')
@@ -72,32 +74,65 @@ class VideoSSL(pl.LightningModule):
         self.test_cache = []
 
     def training_step(self, batch, batch_idx):
+        # NOTE: The comments below assume batchsize=1
+        # features_raw [A 2D Tensor of size=self.n_frames(default 256) x frame embedding dims, representing the input frame embeddings of the sampled frames from a video]
+        # mask [A 1D array of Trues/Falses of size=self.n_frames(default 256)]
+        # gt [A 1D tensor of action-ids of size=self.n_frames(default 256)]
+        # fname [Video's filename]
+        # n_subactions [No. of unique action-classes]
         features_raw, mask, gt, fname, n_subactions = batch
+
+        #TODO: Don't need clusters anymore since we're removing action embeddings
         with torch.no_grad():
             self.clusters.data = F.normalize(self.clusters.data, dim=-1)
+        
+        # MLP's last layer size (D=40 in desktop_assembly)
         D = self.layer_sizes[-1]
+        
+        # B(batch size), T(no. of frames or timesteps) and _(feature dims which is 512 in desktop_assembly)
         B, T, _ = features_raw.shape
+        
+        # Reshape features_raw from 3D(B x T x _) to 2D(B*T x _) tensor, while keeping the feature dimension(_=512 in desktop_assembly) intact.
+        # Pass it through the MLP (which has input layer size 512 and output layer size D=40 for desktop_assembly).
+        # Reshape the MLP output from (B*T x D) to (B x T x D)
+        # Normalize features along the last dimension(-1), so each feature vector along D and across B and T has unit norm, for stable training.
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
+        
+        #TODO: Repeat the above to pass the 2nd vid's features_raw through the MLP to get another features(frame embeddings for 2nd vid)
+        
+        #TODO: Don't need clusters anymore since we're removing action embeddings, replace with Y(vid2 embeddings)
+        #TODO: Figure out what codes and opt_codes look like before replacing them
+        # Eq (6)
         codes = torch.exp(features @ self.clusters.T[None, ...] / self.temp)
         codes = codes / codes.sum(dim=-1, keepdim=True)
-        with torch.no_grad():  # pseudo-labels from OT
+        
+        # Produce pseudo-labels using ASOT, note that we don't backpropagate through this part
+        with torch.no_grad():
+            # Calculate the KOT cost matrix from the paragraph above Eq (7)
+            # ρR = rho * Temporal prior 
             temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
+            # Cost Matrix Ck from section 4.2
             cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
+            # Ĉk = Ck + ρR
             cost_matrix += temp_prior
+
+            # opt_codes is pseudo-labels Tb of shape(B x T x no. action-classes), each cell is the probability(of assigning) a frame to an actions-class TODO???
             opt_codes, _ = asot.segment_asot(cost_matrix, mask, eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
                                              ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_train,
                                              lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train, step_size=self.step_size)
 
+        # Eq (7)
         loss_ce = -((opt_codes * torch.log(codes + num_eps)) * mask[..., None]).sum(dim=2).mean()
         self.log('train_loss', loss_ce)
         return loss_ce
 
-    def validation_step(self, batch, batch_idx):  # subsample videos
+    def validation_step(self, batch, batch_idx):
         features_raw, mask, gt, fname, n_subactions = batch
         D = self.layer_sizes[-1]
         B, T, _ = features_raw.shape
-        # import pdb; pdb.set_trace()
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
+
+        #TODO: Repeat the above to pass the 2nd vid's features_raw through the MLP to get another features
 
         # log clustering metrics over full epoch
         temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
@@ -188,16 +223,16 @@ class VideoSSL(pl.LightningModule):
             # plt.close()
         return None
     
-    def test_step(self, batch, batch_idx):  # subsample videos
+    def test_step(self, batch, batch_idx):
+        # NOTE: The comments below assume batchsize=1
+        # features_raw [A 2D Tensor of size=no. of frames x frame embedding dims, representing the input frame embeddings of a video]
+        # mask [A 1D array of Trues of size=no. of frames]
+        # gt [A 1D tensor of action-ids of size=no. of frames]
+        # fname [Video's filename]
+        # n_subactions [No. of unique action-classes]
         features_raw, mask, gt, fname, n_subactions = batch
-        # MLP's last layer size (D=40 in desktop_assembly)
         D = self.layer_sizes[-1]
-        # B(batch size), T(no. of frames or timesteps) and _(feature dims which is 512 in desktop_assembly)
         B, T, _ = features_raw.shape
-        # Reshape features_raw from 3D(B x T x _) to 2D(B*T x _) tensor, while keeping the feature dimension(_=512 in desktop_assembly) intact.
-        # Pass it through the MLP (which has input layer size 512 and output layer size D=40 for desktop_assembly).
-        # Reshape the MLP output from (B*T x D) to (B x T x D)
-        # Normalize features along the last dimension(-1), so each feature vector along D and across B and T has unit norm, for stable training.
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
 
         # log clustering metrics over full epoch
@@ -299,6 +334,7 @@ class VideoSSL(pl.LightningModule):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train representation learning pipeline")
 
+    #TODO: Change args to only keep what we need and add any new args that we might need
     # FUGW OT segmentation parameters
     parser.add_argument('--alpha-train', '-at', type=float, default=0.3, help='weighting of KOT term on frame features in OT')
     parser.add_argument('--alpha-eval', '-ae', type=float, default=0.6, help='weighting of KOT term on frame features in OT')
@@ -349,9 +385,11 @@ if __name__ == '__main__':
 
     pl.seed_everything(args.seed)
     
+    #TODO: Modify VideoDataset, DataLoader and create a new file structure to read 2 videos and their labels, however pouring formats it
     # Set the paths for the data directory, its structure is mentioned in the README 
     data_val = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=False, action_class=args.activity)
     data_train = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=True, action_class=args.activity)
+    # Only difference is passing n_frames=None
     data_test = VideoDataset('../../data', args.dataset, None, standardise=args.std_feats, random=False, action_class=args.activity)
     val_loader = DataLoader(data_val, batch_size=args.batch_size, shuffle=False)
     train_loader = DataLoader(data_train, batch_size=args.batch_size, shuffle=True)
@@ -359,6 +397,8 @@ if __name__ == '__main__':
 
     if args.ckpt is not None:
         ssl = VideoSSL.load_from_checkpoint(args.ckpt)
+    
+    #TODO: Initialize using only the arguments we will need
     else:
         ssl = VideoSSL(layer_sizes=args.layers, n_clusters=args.n_clusters, alpha_train=args.alpha_train, alpha_eval=args.alpha_eval,
                        ub_frames=args.ub_frames, ub_actions=args.ub_actions, lambda_frames_train=args.lambda_frames_train, lambda_frames_eval=args.lambda_frames_eval,
@@ -370,6 +410,7 @@ if __name__ == '__main__':
     logger = pl.loggers.WandbLogger(name=name, project='video_ssl', save_dir='wandb') if args.wandb else None
     trainer = pl.Trainer(devices=[args.gpu], check_val_every_n_epoch=args.val_freq, max_epochs=args.n_epochs, log_every_n_steps=50, logger=logger)
 
+    #TODO: Don't need clusters anymore since we're removing action embeddings
     if args.k_means and args.ckpt is None:
         ssl.fit_clusters(train_loader, args.n_clusters)
 

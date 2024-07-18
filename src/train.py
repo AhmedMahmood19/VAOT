@@ -82,7 +82,7 @@ class VideoSSL(pl.LightningModule):
         # n_subactions [No. of unique action-classes]
         features_raw, mask, gt, fname, n_subactions = batch
 
-        #TODO: Don't need clusters anymore since we're removing action embeddings
+        #TODO: Don't need clusters anymore since we're removing action embeddings, BUT we need the normalization for embeddings X and Y
         with torch.no_grad():
             self.clusters.data = F.normalize(self.clusters.data, dim=-1)
         
@@ -111,12 +111,12 @@ class VideoSSL(pl.LightningModule):
             # Calculate the KOT cost matrix from the paragraph above Eq (7)
             # ρR = rho * Temporal prior 
             temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-            # Cost Matrix Ck from section 4.2
+            # Cost Matrix Ck from section 4.2, no need to divide by norms since both vectors were previously normalized with F.normalize()
             cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
             # Ĉk = Ck + ρR
             cost_matrix += temp_prior
 
-            # opt_codes is pseudo-labels Tb of shape(B x T x no. action-classes), each cell is the probability(of assigning) a frame to an actions-class TODO???
+            # opt_codes is pseudo-labels Tb of shape(B x T x no. action-classes), each cell is the probability(of assigning) a frame to an actions-class TODO not sure about this???
             opt_codes, _ = asot.segment_asot(cost_matrix, mask, eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
                                              ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_train,
                                              lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train, step_size=self.step_size)

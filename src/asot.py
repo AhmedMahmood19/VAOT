@@ -15,6 +15,18 @@ def construct_Cv_filter(N, r, device):
     weights[abs_r] = 0.
     return weights[None, None, :]
 
+def construct_Ca_filter(N, r, device):
+    abs_r = int(N*r)
+    weights = torch.zeros(2 * abs_r + 1, device=device)
+    weights[abs_r] = 1
+    return weights[None, None, :]
+
+def mult_Ca(Ca_weights, X):
+    B, N, K = X.shape
+    X_reshaped = X.permute(0, 2, 1).reshape(-1, 1, N)
+    Y_flat = F.conv1d(X_reshaped, Ca_weights, padding='same')
+    Y_flat_expanded = Y_flat.view(B, K, N).permute(0, 2, 1)
+    return Y_flat_expanded
 
 def mult_Cv(Cv_weights, X):
     # X is equivalent to T*Ca
@@ -28,11 +40,11 @@ def mult_Cv(Cv_weights, X):
 # ASOT objective function gradients for mirro descent solver
 
 # NOTE: This is used to compute the FGW objective from eq (3), as well as to compute the gradient or derivative of eq (3) w.r.t. T  
-def grad_fgw(T, cost_matrix, alpha, Cv):
+def grad_fgw(T, cost_matrix, alpha, Cv, Ca):
     # Shortcut for computing T*Ca, where T.shape=(B,N,K) and Ca.shape=(B,K,K) and Ca would have 0s in the diagonal and 1s everywhere else
-    T_Ck = T.sum(dim=2, keepdim=True) - T
+    T_Ca = mult_Ca(Ca, T)
     # Returns alpha*(Cv*T*Ca) + (1-alpha)*(Ck)
-    return alpha * mult_Cv(Cv, T_Ck) + (1. - alpha) * cost_matrix
+    return alpha * mult_Cv(Cv, T_Ca) + (1. - alpha) * cost_matrix
 
 def grad_kld(T, p, lambd, axis):
     # p is marginal, dim is marginal axes
@@ -107,7 +119,8 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
     # (Steps 3 and 4 are a shortcut to compute the 2 dot/inner products with T, apply alpha weights, and add them)
     # fgw_obj = (alpha)*<Cv*T*Ca, T> + (1-alpha)*<Ck, T>
     Cv = construct_Cv_filter(N, radius, dev)
-    fgw_obj = (grad_fgw(T_mask, cost_matrix, alpha, Cv) * T_mask).sum(dim=(1, 2))
+    Ca = construct_Ca_filter(N, radius, dev)
+    fgw_obj = (grad_fgw(T_mask, cost_matrix, alpha, Cv, Ca) * T_mask).sum(dim=(1, 2))
     
     # Unbalanced stuff
     # TODO: The code until just before entr is for the KLD in eq (4), might have to remove this for a Balanced OT
@@ -176,7 +189,7 @@ def segment_asot(cost_matrix, mask_X=None, mask_Y=None, eps=0.07, alpha=0.3, rad
     
     # Read comments in the function definition
     Cv = construct_Cv_filter(N, radius, dev)
-    
+    Ca = construct_Ca_filter(N, radius, dev)
     # the trace stores all of the computed objs(transportation costs)
     obj_trace = []
     # Iteration number for the outer loop
@@ -196,7 +209,7 @@ def segment_asot(cost_matrix, mask_X=None, mask_Y=None, eps=0.07, alpha=0.3, rad
         
         # TODO: Might have to add/remove gradient terms when we make any changes above this
         # gradient of objective function required for mirror descent step
-        fgw_cost_matrix = grad_fgw(T, cost_matrix, alpha, Cv)
+        fgw_cost_matrix = grad_fgw(T, cost_matrix, alpha, Cv, Ca)
         grad_obj = fgw_cost_matrix - grad_entropy(T, eps)
         if ub_frames:
             grad_obj += grad_kld(T, dx, lambda_frames, 2)

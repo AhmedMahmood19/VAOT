@@ -411,10 +411,10 @@ if __name__ == '__main__':
     
     #TODO: Modify VideoDataset, DataLoader and create a new file structure to read 2 videos and their labels
     # Set the paths for the data directory, its structure is mentioned in the README 
-    data_val = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=False, action_class=args.activity)
-    data_train = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=True, action_class=args.activity)
+    data_val = VideoDataset('../data', args.dataset, args.n_frames, standardise=args.std_feats, random=False, action_class=args.activity)
+    data_train = VideoDataset('../data', args.dataset, args.n_frames, standardise=args.std_feats, random=True, action_class=args.activity)
     # Only difference is passing n_frames=None
-    data_test = VideoDataset('../../data', args.dataset, None, standardise=args.std_feats, random=False, action_class=args.activity)
+    data_test = VideoDataset('../data', args.dataset, None, standardise=args.std_feats, random=False, action_class=args.activity)
     val_loader = DataLoader(data_val, batch_size=args.batch_size, shuffle=False)
     train_loader = DataLoader(data_train, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(data_test, batch_size=1, shuffle=False)

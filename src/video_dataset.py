@@ -15,6 +15,8 @@ def parse_action_name(fname, dataset):
         return ''
     if dataset == 'desktop_assembly':  # only one activity class
         return ''
+    if dataset == 'penn_action':  # only one activity class (TODO:for now)
+        return ''
     raise ValueError(f'{dataset} is not a valid dataset!')
 
 
@@ -28,10 +30,16 @@ class VideoDataset(Dataset):
         else:
             granularity = None
         self.data_dir = path.join(root_dir, self.dataset)
+
+        # penn_action files don't have a '-' or '_' in the name
+        if self.dataset == 'penn_action':
+            self.video_fnames = sorted([fname for fname in os.listdir(path.join(self.data_dir, 'groundTruth'))])
         # Store a sorted list of all the groundTruth filenames that have a '-' or '_' anywhere in the name
-        self.video_fnames = sorted([fname for fname in os.listdir(path.join(self.data_dir, 'groundTruth'))
+        else:
+            self.video_fnames = sorted([fname for fname in os.listdir(path.join(self.data_dir, 'groundTruth'))
                                     if len(fname.split('_')) > 1 or len(fname.split('-')) > 1])
-        if self.dataset in ['FS', 'desktop_assembly']:
+
+        if self.dataset in ['FS', 'desktop_assembly', 'penn_action']:
             action_class = ''
         if action_class != ['all']:
             if type(action_class) is list:
@@ -60,25 +68,43 @@ class VideoDataset(Dataset):
         return len(self.video_fnames)
     
     def __getitem__(self, idx):
-        #  Get the fname for current vid
-        video_fname = self.video_fnames[idx]
-        # Load that vid's groundTruth file, convert it into a list of action-classes
-        gt = [line.rstrip() for line in open(path.join(self.data_dir, 'groundTruth', video_fname))]
+        # Get the filename for video X
+        video_fname_X = self.video_fnames[idx]
+        
+        # Randomly select another video index ensuring its different from idx
+        other_idx = (idx + np.random.randint(1, len(self.video_fnames))) % len(self.video_fnames)
+        # Get the filename for video Y
+        video_fname_Y = self.video_fnames[other_idx]
 
+        # Load the required data for each video
+        features_X, mask_X, gt_X, video_fname_X, unique_actions_X = self._load_video_data(video_fname_X)
+        features_Y, mask_Y, gt_Y, video_fname_Y, unique_actions_Y = self._load_video_data(video_fname_Y)
+
+        # Return it for the batch
+        return (features_X, mask_X, gt_X, video_fname_X, unique_actions_X), (features_Y, mask_Y, gt_Y, video_fname_Y, unique_actions_Y)
+
+    def _load_video_data(self, video_fname):
+        # Load this vid's groundTruth file, convert it into a list of action-classes
+        gt = [line.rstrip() for line in open(path.join(self.data_dir, 'groundTruth', video_fname))]
+        
         # __getitem__ is supposed to return the features and labels corresponding to the frames in a video, 
-        # but we don't always want to use all the frames in the video so we would sample some amount of frames
-        # __getitem__ calls this function to determine exactly what frames from the video will we use
+        # but sometimes we don't want to use all of the frames in the video, so we sample some amount of frames
+        # calling this function determines exactly what frames from the video we will be using
         inds, mask = self._partition_and_sample(self.n_frames, len(gt))
-        # We will use inds to store the features and gt for only the sampled frames
-        # Converts the list of action-classes into a PyTorch tensor of action-ids, filtered by inds.
+
+        # We will use inds, to store the features and gt for only the sampled frames
+        # Converts the list of action-classes into a PyTorch tensor of action-ids, filtered by inds
         # Now ground truth is represented by a tensor of longs
         gt = torch.Tensor([self.action_mapping[gt[ind]] for ind in inds]).long()
+
+        # Load features
         action = parse_action_name(video_fname, self.dataset)
         feat_fname = path.join(self.data_dir, 'features', action, video_fname)
         try:
             features = np.loadtxt(feat_fname + '.txt')[inds, :]
         except:
             features = np.load(feat_fname + '.npy')[inds, :]
+
         if self.standardise:  # normalize features
             zmask = np.ones(features.shape[0], dtype=bool)
             for rdx, row in enumerate(features):
@@ -90,6 +116,7 @@ class VideoDataset(Dataset):
             features[zmask] = z
             features = np.nan_to_num(features)
             features /= np.sqrt(features.shape[1])
+        
         features = torch.from_numpy(features).float()
         return features, mask, gt, video_fname, gt.unique().shape[0]
     

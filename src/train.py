@@ -7,12 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-import wandb
 import os
 
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import pdist, squareform
-from sklearn.cluster import KMeans
 
 from video_dataset import VideoDataset
 import asot
@@ -26,12 +24,11 @@ class VideoSSL(pl.LightningModule):
     def __init__(self, lr=1e-4, weight_decay=1e-4, layer_sizes=[64, 128, 40], n_clusters=20, alpha_train=0.3, alpha_eval=0.3,
                  n_ot_train=[50, 1], n_ot_eval=[50, 1], step_size=None, train_eps=0.06, eval_eps=0.01, ub_frames=False, ub_actions=True,
                  lambda_frames_train=0.05, lambda_actions_train=0.05, lambda_frames_eval=0.05, lambda_actions_eval=0.01,
-                 temp=0.1, radius_gw=0.04, learn_clusters=True, n_frames=256, rho=0.1, exclude_cls=None, visualize=False):
+                 temp=0.1, radius_gw=0.04, n_frames=256, rho=0.1, exclude_cls=None, visualize=False):
         super().__init__()
         self.lr = lr
         self.weight_decay = weight_decay
         self.n_clusters = n_clusters
-        self.learn_clusters = learn_clusters
         self.layer_sizes = layer_sizes
         self.exclude_cls = exclude_cls
         self.visualize = visualize
@@ -60,10 +57,6 @@ class VideoSSL(pl.LightningModule):
         layers += [nn.Linear(layer_sizes[-2], layer_sizes[-1])]
         self.mlp = nn.Sequential(*layers)
 
-        #TODO: Don't need clusters anymore since we're removing action embeddings
-        # initialize cluster centers/codebook
-        d = self.layer_sizes[-1]
-        self.clusters = nn.parameter.Parameter(data=F.normalize(torch.randn(self.n_clusters, d), dim=-1), requires_grad=learn_clusters)
 
         #TODO: Need to replace with evaluation metrics for video alignment
         # initialize evaluation metrics
@@ -74,73 +67,98 @@ class VideoSSL(pl.LightningModule):
         self.test_cache = []
 
     def training_step(self, batch, batch_idx):
-        # NOTE: The comments below assume batchsize=1
+        # NOTE: The comments below assume batchsize=1 so we dont talk about the batch element dimension
         # features_raw [A 2D Tensor of size=self.n_frames(default 256) x frame embedding dims, representing the input frame embeddings of the sampled frames from a video]
         # mask [A 1D array of Trues/Falses of size=self.n_frames(default 256)]
         # gt [A 1D tensor of action-ids of size=self.n_frames(default 256)]
         # fname [Video's filename]
-        # n_subactions [No. of unique action-classes]
-        features_raw, mask, gt, fname, n_subactions = batch
+        # n_subactions [No. of unique action-classes amongst the randomly sampled frames/gt]
 
-        #TODO: Don't need clusters anymore since we're removing action embeddings, BUT we need the normalization for embeddings X and Y
-        with torch.no_grad():
-            self.clusters.data = F.normalize(self.clusters.data, dim=-1)
-        
-        # MLP's last layer size (D=40 in desktop_assembly)
+        features_raw_X, mask_X, gt_X, fname_X, n_subactions_X = batch[0]
+        features_raw_Y, mask_Y, gt_Y, fname_Y, n_subactions_Y = batch[1]
+
+        # MLP's last layer size (D=40 for penn_action)
         D = self.layer_sizes[-1]
-        
-        # B(batch size), T(no. of frames or timesteps) and _(feature dims which is 512 in desktop_assembly)
-        B, T, _ = features_raw.shape
-        
-        # Reshape features_raw from 3D(B x T x _) to 2D(B*T x _) tensor, while keeping the feature dimension(_=512 in desktop_assembly) intact.
-        # Pass it through the MLP (which has input layer size 512 and output layer size D=40 for desktop_assembly).
+
+        ## Process the features of video X
+        # B(batch size), T(no. of frames or timesteps) and _(feature dim/frame embedding size, which is 1024 in penn_action)
+        B_X, T_X, _ = features_raw_X.shape
+        # Reshape features_raw from 3D(B x T x _) to 2D(B*T x _) tensor, while keeping the feature dim intact
+        # Pass it through the MLP: input layer size=_ and output layer size=D
         # Reshape the MLP output from (B*T x D) to (B x T x D)
-        # Normalize features along the last dimension(-1), so each feature vector along D and across B and T has unit norm, for stable training.
-        features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
-        
-        #TODO: Repeat the above to pass the 2nd vid's features_raw through the MLP to get another features(frame embeddings for 2nd vid)
-        
-        #TODO: Don't need clusters anymore since we're removing action embeddings, replace with Y(vid2 embeddings)
-        #TODO: Figure out what codes and opt_codes look like before replacing them
+        # Normalize features along the last dimension(-1), so each feature vector along D and across B and T has unit norm, for stable training
+        features_X = F.normalize(
+            self.mlp(features_raw_X.reshape(-1, features_raw_X.shape[-1])).reshape(B_X, T_X, D),
+            dim=-1
+        )
+
+        ## Process the features of video Y
+        B_Y, T_Y, _ = features_raw_Y.shape
+        features_Y = F.normalize(
+            self.mlp(features_raw_Y.reshape(-1, features_raw_Y.shape[-1])).reshape(B_Y, T_Y, D),
+            dim=-1
+        )
         # Eq (6)
-        codes = torch.exp(features @ self.clusters.T[None, ...] / self.temp)
+        # codes represent a matrix P for each batch element
+        # size of a matrix P is (no. of frames in X x no. of frames in Y)
+        # P_ij represents the prob. of the frame_i in X being aligned with the frame_j in Y
+        codes = torch.exp(features_X @ features_Y.transpose(1, 2) / self.temp)
         codes = codes / codes.sum(dim=-1, keepdim=True)
         
         # Produce pseudo-labels using ASOT, note that we don't backpropagate through this part
         with torch.no_grad():
             # Calculate the KOT cost matrix from the paragraph above Eq (7)
             # ρR = rho * Temporal prior 
-            temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
+            temp_prior = asot.temporal_prior(T_X, T_Y, self.rho, features_X.device)
             # Cost Matrix Ck from section 4.2, no need to divide by norms since both vectors were previously normalized with F.normalize()
-            cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
+            cost_matrix = 1. - features_X @ features_Y.transpose(1, 2)
             # Ĉk = Ck + ρR
             cost_matrix += temp_prior
 
-            # opt_codes is pseudo-labels Tb of shape(B x T x no. action-classes), each cell is the probability(of assigning) a frame to an actions-class TODO not sure about this???
-            opt_codes, _ = asot.segment_asot(cost_matrix, mask, eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
-                                             ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_train,
-                                             lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train, step_size=self.step_size)
+            # opt_codes represent a matrix Tb for each batch element
+            # size of a matrix Tb is (no. of frames in X x no. of frames in Y)
+            # Tb are the (soft) pseudo-labels defined above Eq (7)
+            # Tb_ij represents the prob. of the frame_i in X being aligned with the frame_j in Y
+            opt_codes, _ = asot.segment_asot(cost_matrix=cost_matrix, mask_X=mask_X, mask_Y=mask_Y, 
+                                             eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
+                                             ub_frames=self.ub_frames, ub_actions=self.ub_actions, 
+                                             lambda_frames=self.lambda_frames_train, lambda_actions=self.lambda_actions_train, 
+                                             n_iters=self.n_ot_train, step_size=self.step_size)
 
         # Eq (7)
-        loss_ce = -((opt_codes * torch.log(codes + num_eps)) * mask[..., None]).sum(dim=2).mean()
+        loss_ce = -((opt_codes * torch.log(codes + num_eps)) * mask_X.unsqueeze(2) * mask_Y.unsqueeze(1)).sum(dim=2).mean()
         self.log('train_loss', loss_ce)
         return loss_ce
 
     def validation_step(self, batch, batch_idx):
-        features_raw, mask, gt, fname, n_subactions = batch
-        D = self.layer_sizes[-1]
-        B, T, _ = features_raw.shape
-        features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
+        features_raw_X, mask_X, gt_X, fname_X, n_subactions_X = batch[0]
+        features_raw_Y, mask_Y, gt_Y, fname_Y, n_subactions_Y = batch[1]
 
-        #TODO: Repeat the above to pass the 2nd vid's features_raw through the MLP to get another features
+        D = self.layer_sizes[-1]
+        
+        B_X, T_X, _ = features_raw_X.shape
+        features_X = F.normalize(
+            self.mlp(features_raw_X.reshape(-1, features_raw_X.shape[-1])).reshape(B_X, T_X, D),
+            dim=-1
+        )
+
+        B_Y, T_Y, _ = features_raw_Y.shape
+        features_Y = F.normalize(
+            self.mlp(features_raw_Y.reshape(-1, features_raw_Y.shape[-1])).reshape(B_Y, T_Y, D),
+            dim=-1
+        )
 
         # log clustering metrics over full epoch
-        temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-        cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
+        temp_prior = asot.temporal_prior(T_X, T_Y, self.rho, features_X.device)
+        cost_matrix = 1. - features_X @ features_Y.transpose(1, 2)
         cost_matrix += temp_prior
-        segmentation, _ = asot.segment_asot(cost_matrix, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
-                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_eval,
-                                            lambda_actions=self.lambda_actions_eval, n_iters=self.n_ot_eval, step_size=self.step_size)
+        segmentation, _ = asot.segment_asot(cost_matrix=cost_matrix, mask_X=mask_X, mask_Y=mask_Y, 
+                                            eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
+                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions,
+                                            lambda_frames=self.lambda_frames_eval, lambda_actions=self.lambda_actions_eval,
+                                            n_iters=self.n_ot_eval, step_size=self.step_size)
+
+        #TODO: Adjust the evaluation code below for video alignment
         segments = segmentation.argmax(dim=2)
         self.mof.update(segments, gt, mask)
         self.f1.update(segments, gt, mask)
@@ -161,66 +179,75 @@ class VideoSSL(pl.LightningModule):
         loss_ce = -((pseudo_labels * torch.log(codes + num_eps)) * mask[..., None]).sum(dim=[1, 2]).mean()
         self.log('val_loss', loss_ce)
 
-        # plot qualitative examples of pseduo-labelling and embeddings for 5 videos evenly spaced in dataset
-        spacing =  int(self.trainer.num_val_batches[0] / 5)
 
-        # NOTE: False added here to temporarily disable producing visualizations during development
-        # NOTE: Wandb seems to be a paid feature, so I replaced it by saving visualizations locally, all wandb code should be commented out
-        if batch_idx % spacing == 0 and self.visualize and False:
-        # if batch_idx % spacing == 0 and wandb.run is not None and self.visualize:
+        ### TODO: Commenting out visualizations during development
+        # # plot qualitative examples of pseduo-labelling and embeddings for 5 videos evenly spaced in dataset
+        # spacing =  int(self.trainer.num_val_batches[0] / 5)
 
-            # Make a dir to store visualizations
-            output_dir = 'visualisations'
-            os.makedirs(output_dir, exist_ok=True)
+        # if batch_idx % spacing == 0 and self.visualize:
 
-            plot_idx = int(batch_idx / spacing)
-            gt_cpu = gt[0].cpu().numpy()
+        #     # Make a dir to store visualizations
+        #     output_dir = 'visualisations'
+        #     os.makedirs(output_dir, exist_ok=True)
 
-            fdists = squareform(pdist(features[0].cpu().numpy(), 'cosine'))
-            fig = plot_matrix(fdists, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(5, 5), xlabel='Frame index', ylabel='Frame index')
-            fig_path = os.path.join(output_dir, f"val_pairwise_{plot_idx}.png")
-            fig.savefig(fig_path)
-            plt.close(fig)
-            # wandb.log({f"val_pairwise_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # plt.close()
-            fig = plot_matrix(codes[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
-            fig_path = os.path.join(output_dir, f"val_P_{plot_idx}.png")
-            fig.savefig(fig_path)
-            plt.close(fig)
-            # wandb.log({f"val_P_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # plt.close()
-            fig = plot_matrix(pseudo_labels[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
-            fig_path = os.path.join(output_dir, f"val_OT_PL_{plot_idx}.png")
-            fig.savefig(fig_path)
-            plt.close(fig)
-            # wandb.log({f"val_OT_PL_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # plt.close()
-            fig = plot_matrix(segmentation[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
-            fig_path = os.path.join(output_dir, f"val_OT_pred_{plot_idx}.png")
-            fig.savefig(fig_path)
-            plt.close(fig)
-            # wandb.log({f"val_OT_pred_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # plt.close()
+        #     plot_idx = int(batch_idx / spacing)
+        #     gt_cpu = gt[0].cpu().numpy()
 
-            # cost_mat = 1. - features @ self.clusters.T
-            # bal_codes = asot.segment_asot(features, self.clusters, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
-            #                                 proj_type='const', ub_weight=self.ub_eval, n_iters=self.n_ot_eval, temp_prior=temp_prior)
-            # nogw_codes = asot.segment_asot(features, self.clusters, mask, eps=self.eval_eps, alpha=0., radius=self.radius_gw,
-            #                                 proj_type=self.ub_proj_type, ub_weight=self.ub_eval, n_iters=self.n_ot_eval, temp_prior=temp_prior)
-            # fig = plot_segmentation(segments[0], mask[0], name=f'{fname[0]}')
-            # wandb.log({f"val_segment_{int(batch_idx / spacing)}": wandb.Image(fig), "trainer/global_step": self.trainer.global_step})
+        #     fdists = squareform(pdist(features[0].cpu().numpy(), 'cosine'))
+        #     fig = plot_matrix(fdists, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(5, 5), xlabel='Frame index', ylabel='Frame index')
+        #     fig_path = os.path.join(output_dir, f"val_pairwise_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
 
-            # fig = plot_matrix(segmentation[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
-            # wandb.log({f"pred_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # fig = plot_matrix(cost_mat[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
-            # wandb.log({f"cost_mat_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # fig = plot_matrix(1. - cost_mat[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
-            # wandb.log({f"aff_mat_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # fig = plot_matrix(bal_codes[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
-            # wandb.log({f"bal_pred_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # fig = plot_matrix(nogw_codes[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
-            # wandb.log({f"nogw_{plot_idx}": fig, "trainer/global_step": self.trainer.global_step})
-            # plt.close()
+        #     fig = plot_matrix(codes[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"val_P_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     fig = plot_matrix(pseudo_labels[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"val_OT_PL_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     fig = plot_matrix(segmentation[0].cpu().numpy().T, gt=gt_cpu, colorbar=False, title=fname[0], figsize=(10, 5), xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"val_OT_pred_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     cost_mat = 1. - features @ self.clusters.T
+        #     bal_codes = asot.segment_asot(features, self.clusters, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
+        #                                     proj_type='const', ub_weight=self.ub_eval, n_iters=self.n_ot_eval, temp_prior=temp_prior)
+        #     nogw_codes = asot.segment_asot(features, self.clusters, mask, eps=self.eval_eps, alpha=0., radius=self.radius_gw,
+        #                                     proj_type=self.ub_proj_type, ub_weight=self.ub_eval, n_iters=self.n_ot_eval, temp_prior=temp_prior)
+        #     fig = plot_segmentation(segments[0], mask[0], name=f'{fname[0]}')
+        #     fig_path = os.path.join(output_dir, f"val_segment_{int(batch_idx / spacing)}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     fig = plot_matrix(segmentation[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"pred_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+            
+        #     fig = plot_matrix(cost_mat[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"cost_mat_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     fig = plot_matrix(1. - cost_mat[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"aff_mat_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+            
+        #     fig = plot_matrix(bal_codes[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"bal_pred_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
+
+        #     fig = plot_matrix(nogw_codes[0].cpu().numpy().T, gt=None, colorbar=False, title=None, xlabel='Frame index', ylabel='Action index')
+        #     fig_path = os.path.join(output_dir, f"nogw_{plot_idx}.png")
+        #     fig.savefig(fig_path)
+        #     plt.close(fig)
         return None
     
     def test_step(self, batch, batch_idx):
@@ -229,21 +256,36 @@ class VideoSSL(pl.LightningModule):
         # mask [A 1D array of Trues of size=no. of frames]
         # gt [A 1D tensor of action-ids of size=no. of frames]
         # fname [Video's filename]
-        # n_subactions [No. of unique action-classes]
-        features_raw, mask, gt, fname, n_subactions = batch
+        # n_subactions [No. of unique action-classes amongst the randomly sampled frames/gt]
+
+        features_raw_X, mask_X, gt_X, fname_X, n_subactions_X = batch[0]
+        features_raw_Y, mask_Y, gt_Y, fname_Y, n_subactions_Y = batch[1]
+
         D = self.layer_sizes[-1]
-        B, T, _ = features_raw.shape
-        features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
+        
+        B_X, T_X, _ = features_raw_X.shape
+        features_X = F.normalize(
+            self.mlp(features_raw_X.reshape(-1, features_raw_X.shape[-1])).reshape(B_X, T_X, D),
+            dim=-1
+        )
+
+        B_Y, T_Y, _ = features_raw_Y.shape
+        features_Y = F.normalize(
+            self.mlp(features_raw_Y.reshape(-1, features_raw_Y.shape[-1])).reshape(B_Y, T_Y, D),
+            dim=-1
+        )
 
         # log clustering metrics over full epoch
-        temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-        cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
+        temp_prior = asot.temporal_prior(T_X, T_Y, self.rho, features_X.device)
+        cost_matrix = 1. - features_X @ features_Y.transpose(1, 2)
         cost_matrix += temp_prior
-        # segmentation is T of shape(B x T x no. action-classes), it represents probabilities(assignments) of frames to actions-classes/clusters
-        segmentation, _ = asot.segment_asot(cost_matrix, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
-                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_eval,
-                                            lambda_actions=self.lambda_actions_eval, n_iters=self.n_ot_eval, step_size=self.step_size)
-        # Get the indices/action-ids of the action-classes(dim=2) with the highest probability for each frame, thus producing action-ids as the predictions
+        segmentation, _ = asot.segment_asot(cost_matrix=cost_matrix, mask_X=mask_X, mask_Y=mask_Y, 
+                                            eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
+                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions,
+                                            lambda_frames=self.lambda_frames_eval, lambda_actions=self.lambda_actions_eval,
+                                            n_iters=self.n_ot_eval, step_size=self.step_size)
+
+        #TODO: Adjust the evaluation code below for video alignment
         segments = segmentation.argmax(dim=2)
 
         # NOTE: Uncomment this code to store the predictions as a file, this is used on the colab notebook to make visualizations
@@ -268,6 +310,7 @@ class VideoSSL(pl.LightningModule):
         return None
     
     def on_validation_epoch_end(self):
+        #TODO: Adjust the evaluation code below for video alignment
         mof, pred_to_gt = self.mof.compute(exclude_cls=self.exclude_cls)
         f1, _ = self.f1.compute(exclude_cls=self.exclude_cls, pred_to_gt=pred_to_gt)
         miou, _ = self.miou.compute(exclude_cls=self.exclude_cls, pred_to_gt=pred_to_gt)
@@ -279,6 +322,7 @@ class VideoSSL(pl.LightningModule):
         self.miou.reset()
 
     def on_test_epoch_end(self):
+        #TODO: Adjust the evaluation code below for video alignment
         mof, pred_to_gt = self.mof.compute(exclude_cls=self.exclude_cls)
         f1, _ = self.f1.compute(exclude_cls=self.exclude_cls, pred_to_gt=pred_to_gt)
         miou, _  = self.miou.compute(exclude_cls=self.exclude_cls, pred_to_gt=pred_to_gt)
@@ -286,10 +330,8 @@ class VideoSSL(pl.LightningModule):
         self.log('test_f1_full', f1)
         self.log('test_miou_full', miou)
 
-        # NOTE: Wandb seems to be a paid feature, so I replaced it by saving visualizations locally, all wandb code should be commented out
         if self.visualize:
-        # if wandb.run is not None and self.visualize:
-        
+            
             # Make a dir to store visualizations
             output_dir = 'visualisations'
             os.makedirs(output_dir, exist_ok=True)
@@ -304,8 +346,6 @@ class VideoSSL(pl.LightningModule):
                 fig_path = os.path.join(output_dir, f"test_segment_{i}.png")
                 fig.savefig(fig_path)
                 plt.close(fig)
-                # wandb.log({f"test_segment_{i}": wandb.Image(fig), "trainer/global_step": self.trainer.global_step})
-                # plt.close()
 
         self.test_cache = []
         self.mof.reset()
@@ -315,20 +355,6 @@ class VideoSSL(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
     
-    def fit_clusters(self, dataloader, K):
-        with torch.no_grad():
-            features_full = []
-            self.mlp.eval()
-            for features_raw, _, _, _, _ in dataloader:
-                B, T, _ = features_raw.shape
-                D = self.layer_sizes[-1]
-                features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
-                features_full.append(features)
-            features_full = torch.cat(features_full, dim=0).reshape(-1, features.shape[2]).cpu().numpy()
-            kmeans = KMeans(n_clusters=K).fit(features_full)
-            self.mlp.train()
-        self.clusters.data = torch.from_numpy(kmeans.cluster_centers_).to(self.clusters.device)
-        return None
 
 
 if __name__ == '__main__':
@@ -355,6 +381,7 @@ if __name__ == '__main__':
                         help='Step size/learning rate for ASOT solver. Worth setting manually if ub-frames && ub-actions')
 
     # dataset params
+    ## TODO: Not using this arg since we hardcoded it, add it back in later
     parser.add_argument('--base-path', '-p', type=str, default='/home/users/u6567085/data', help='base directory for dataset')
     parser.add_argument('--dataset', '-d', type=str, required=True, help='dataset to use for training/eval (Breakfast, YTI, FSeval, FS, desktop_assembly)')
     parser.add_argument('--activity', '-ac', type=str, nargs='+', required=True, help='activity classes to select for dataset')
@@ -367,7 +394,6 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', '-bs', type=int, default=2, help='batch size')
     parser.add_argument('--learning-rate', '-lr', type=float, default=1e-3, help='learning rate')
     parser.add_argument('--weight-decay', '-wd', type=float, default=1e-4, help='weight decay for optimizer')
-    parser.add_argument('--k-means', '-km', action='store_false', help='do not initialize clusters with kmeans default = True')
     parser.add_argument('--layers', '-ls', default=[64, 128, 40], nargs='+', type=int, help='layer sizes for MLP (in, hidden, ..., out)')
     parser.add_argument('--rho', type=float, default=0.1, help='Factor for global structure weighting term')
     parser.add_argument('--n-clusters', '-c', type=int, default=8, help='number of actions/clusters')
@@ -375,17 +401,15 @@ if __name__ == '__main__':
     # system/logging params
     parser.add_argument('--val-freq', '-vf', type=int, default=5, help='validation epoch frequency (epochs)')
     parser.add_argument('--gpu', '-g', type=int, default=1, help='gpu id to use')
-    parser.add_argument('--wandb', '-w', action='store_true', help='use wandb for logging')
     parser.add_argument('--visualize', '-v', action='store_true', help='generate visualizations during logging')
     parser.add_argument('--seed', type=int, default=0, help='Random seed initialization')
     parser.add_argument('--ckpt', type=str, help='path to checkpoint')
     parser.add_argument('--eval', action='store_true', help='run evaluation on test set only')
-    parser.add_argument('--group', type=str, default='base', help='wandb experiment group name')
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
     
-    #TODO: Modify VideoDataset, DataLoader and create a new file structure to read 2 videos and their labels, however pouring formats it
+    #TODO: Modify VideoDataset, DataLoader and create a new file structure to read 2 videos and their labels
     # Set the paths for the data directory, its structure is mentioned in the README 
     data_val = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=False, action_class=args.activity)
     data_train = VideoDataset('../../data', args.dataset, args.n_frames, standardise=args.std_feats, random=True, action_class=args.activity)
@@ -405,16 +429,12 @@ if __name__ == '__main__':
                        lambda_actions_train=args.lambda_actions_train, lambda_actions_eval=args.lambda_actions_eval, step_size=args.step_size,
                        train_eps=args.eps_train, eval_eps=args.eps_eval, radius_gw=args.radius_gw, n_ot_train=args.n_ot_train, n_ot_eval=args.n_ot_eval,
                        n_frames=args.n_frames, lr=args.learning_rate, weight_decay=args.weight_decay, rho=args.rho, exclude_cls=args.exclude, visualize=args.visualize)
-    activity_name = '_'.join(args.activity)
-    name = f'{args.dataset}_{activity_name}_{args.group}_seed_{args.seed}'
-    logger = pl.loggers.WandbLogger(name=name, project='video_ssl', save_dir='wandb') if args.wandb else None
-    trainer = pl.Trainer(devices=[args.gpu], check_val_every_n_epoch=args.val_freq, max_epochs=args.n_epochs, log_every_n_steps=50, logger=logger)
-
-    #TODO: Don't need clusters anymore since we're removing action embeddings
-    if args.k_means and args.ckpt is None:
-        ssl.fit_clusters(train_loader, args.n_clusters)
+    
+    # TODO: Added num_sanity_val_steps=0 to disable the initial validation step while I fix the training_step, remove it later
+    trainer = pl.Trainer(devices=[args.gpu], check_val_every_n_epoch=args.val_freq, max_epochs=args.n_epochs, log_every_n_steps=50, logger=None, num_sanity_val_steps=0)
 
     if not args.eval:
-        trainer.validate(ssl, val_loader)
+        # TODO: Uncomment this once the evaluation metrics are fixed
+        # trainer.validate(ssl, val_loader)
         trainer.fit(ssl, train_loader, val_loader)
     trainer.test(ssl, dataloaders=test_loader)

@@ -45,11 +45,11 @@ def grad_entropy(T, eps):
 
 # Sinkhorn projections for balanced ASOT (balanced assignment for frames AND actions)
 
-def project_to_polytope_KL(cost_matrix, mask, eps, dx, dy, n_iters=10, stable_thres=7.):
+def project_to_polytope_KL(cost_matrix, mask_X, mask_Y, eps, dx, dy, n_iters=10, stable_thres=7.):
     # runs sinkhorn algorithm on dual potentials w/log domain stabilization
     dev = cost_matrix.device
     B, N, K = cost_matrix.shape
-    dual_pot = torch.exp(-cost_matrix / eps) * mask.unsqueeze(2)
+    dual_pot = torch.exp(-cost_matrix / eps) * mask_X.unsqueeze(2) * mask_Y.unsqueeze(1)
     dual_pot = dual_pot / dual_pot.max()
     b = torch.ones((B, K, 1), device=dev)
     u = torch.zeros((B, N, 1), device=dev)
@@ -64,7 +64,7 @@ def project_to_polytope_KL(cost_matrix, mask, eps, dx, dy, n_iters=10, stable_th
             if i != n_iters - 1:
                 u = torch.nan_to_num(u + eps * torch.log(a), posinf=0., neginf=0.)
                 v = torch.nan_to_num(v + eps * torch.log(b), posinf=0., neginf=0.)
-                dual_pot = torch.exp((u + v.transpose(1, 2) - cost_matrix) / eps) * mask.unsqueeze(2)
+                dual_pot = torch.exp((u + v.transpose(1, 2) - cost_matrix) / eps) * mask_X.unsqueeze(2) * mask_Y.unsqueeze(1)
                 b = torch.ones_like(b)
     T = a * dual_pot * b.transpose(1, 2)
     return T
@@ -81,14 +81,19 @@ def entropy(T, eps=1e-10):
 
 
 def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
-                   lambda_frames, lambda_actions, mask=None):
+                   lambda_frames, lambda_actions, mask_X=None, mask_Y=None):
     dev = cost_matrix.device
     B, N, K = cost_matrix.shape
         
-    if mask is None:
-        mask = torch.full((B, N), 1, dtype=bool, device=dev)
-    nnz = mask.sum(dim=1)
-    T_mask = T * mask.unsqueeze(2)
+    if mask_X is None:
+        mask_X = torch.full((B, N), 1, dtype=bool, device=dev)
+    if mask_Y is None:
+        mask_Y = torch.full((B, N), 1, dtype=bool, device=dev)
+
+    nnz_X = mask_X.sum(dim=1)
+    nnz_Y = mask_Y.sum(dim=1)
+
+    T_mask = T * mask_X.unsqueeze(2) * mask_Y.unsqueeze(1)
     # The code above is the same as in segment_asot except we don't need to initialize T since it already exists
     # We'll use the masked T for most of the obj, and only use T to calculate the entropy regularization term −ϵH(T) 
 
@@ -106,8 +111,8 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
     
     # Unbalanced stuff
     # TODO: The code until just before entr is for the KLD in eq (4), might have to remove this for a Balanced OT
-    dy = torch.ones((B, K), device=dev) / K
-    dx = torch.ones((B, N), device=dev) / nnz[:, None]
+    dy = torch.ones((B, K), device=dev) / nnz_Y[:, None]
+    dx = torch.ones((B, N), device=dev) / nnz_X[:, None]
     
     frames_marg = T_mask.sum(dim=2)
     frames_ub_penalty = kld(frames_marg, dx) * lambda_frames
@@ -131,35 +136,43 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
 
 # ASOT solver
 
-def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_frames=False,
+def segment_asot(cost_matrix, mask_X=None, mask_Y=None, eps=0.07, alpha=0.3, radius=0.04, ub_frames=False,
                  ub_actions=True, lambda_frames=0.1, lambda_actions=0.05, n_iters=(25, 1),
                  stable_thres=7., step_size=None):
     
     # Get the device of this tensor
     dev = cost_matrix.device
-    # B is batch size, N is no. of frames, K is no. of actions
+    # B is batch size, N is no. of frames in video X, K is no. of frames in video Y
     B, N, K = cost_matrix.shape
 
-    # If no mask, make a mask of shape BxN and fill it with Trues 
-    if mask is None:
-        mask = torch.full((B, N), 1, dtype=bool, device=dev)
+    # For simplicity we keep the 2 masks separate throughout the code
+    # Use mask_X to mask the rows and mask_Y to mask the cols of T
+    # If a mask is None, then make a mask of shape BxN and fill it with Trues 
+    if mask_X is None:
+        mask_X = torch.full((B, N), 1, dtype=bool, device=dev)
+    if mask_Y is None:
+        mask_Y = torch.full((B, N), 1, dtype=bool, device=dev)
 
-    # Compute the no. of Trues in the mask for each video in the batch
-    # (maybe to get the no. of unique frames in each video, instead of using N which includes padding) TODO??? 
-    nnz = mask.sum(dim=1)
+    # When computing p and q from section 4.1, we need to use the actual no. of frames in each video without padding
+    # Count the no. of frames in each video X in this batch, excluding the padding frames(duplicates of the final frame where mask contains a False).
+    nnz_X = mask_X.sum(dim=1)
+    # Repeat the above for each video Y in this batch
+    nnz_Y = mask_Y.sum(dim=1)
 
-    # dy and dx are q and p from section 4.1
-    # ones normalized by K, to represent the uniform distribution over actions 
-    dy = torch.ones((B, K, 1), device=dev) / K
-    # tensor of ones normalized by nnz, to represent the uniform distribution over frames, 
-    dx = torch.ones((B, N, 1), device=dev) / nnz[:, None, None]
+    # dy and dx are q and p respectively from section 4.1
+    # tensor of ones normalized by nnz_Y, to represent the uniform distribution over frames from video Y  
+    dy = torch.ones((B, K, 1), device=dev) / nnz_Y[:, None, None]
+    # tensor of ones normalized by nnz_X, to represent the uniform distribution over frames from video X
+    dx = torch.ones((B, N, 1), device=dev) / nnz_X[:, None, None]
 
     # Initialize the Transportation Matrix according to Appendix A
-    # Compute T for a vid, by setting every element to 1/N*K but here N=nnz. Repeat for every vid in the batch
+    # Compute the T for each batch element, by setting every element of T to 1/N*K, but here N=nnz_X and K=nnz_Y due to padding
     T = dx * dy.transpose(1, 2)
-    # Apply the mask to T to deal with the duplicate frames(where mask is False)
-    # for each frame i where mask[i] is False, set all elements in row i of T to 0
-    T = T * mask.unsqueeze(2)
+
+    # Apply the mask to T to deal with the padding frames, where mask is False
+    # for each frame i of video X where mask_X[i] is False, set all elements in row i of T to 0
+    # for each frame j of video Y where mask_Y[j] is False, set all elements in col j of T to 0
+    T = T * mask_X.unsqueeze(2) * mask_Y.unsqueeze(1)
     
     # Read comments in the function definition
     Cv = construct_Cv_filter(N, radius, dev)
@@ -173,7 +186,7 @@ def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_fr
         with torch.no_grad():
             # Compute the transportation cost for the current transportation matrix T, using the ASOT objective function
             obj = asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
-                                lambda_frames, lambda_actions, mask=mask)
+                                lambda_frames, lambda_actions, mask_X=mask_X, mask_Y=mask_Y)
         # Append the current obj to the trace
         obj_trace.append(obj)
         
@@ -200,7 +213,7 @@ def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_fr
         
         # TODO: Might have to use this condition if we want it to be balanced, thus both would be False
         if not ub_frames and not ub_actions:
-            T = project_to_polytope_KL(fgw_cost_matrix, mask, eps, dx, dy,
+            T = project_to_polytope_KL(fgw_cost_matrix, mask_X, mask_Y, eps, dx, dy,
                                        n_iters=n_iters[1], stable_thres=stable_thres)
         elif not ub_frames:
             T /= T.sum(dim=2, keepdim=True)
@@ -213,11 +226,14 @@ def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_fr
         
         it += 1
     
-    T = T * nnz[:, None, None]  # rescale so marginals per frame sum to 1
+    # The row-sum of every row will be 1.0
+    # TODO: The col-sum of each col is not enforced to be 1.0 right now, might need to change this for VAOT
+    T = T * nnz_X[:, None, None]  # rescale so marginals per frame(of video X) sum to 1
     obj_trace = torch.cat(obj_trace)
     return T, obj_trace
 
 # ρR = rho * Temporal prior
-def temporal_prior(n_frames, n_clusters, rho, device):
-    temp_prior = torch.abs(torch.arange(n_frames)[:, None] / n_frames - torch.arange(n_clusters)[None, :] / n_clusters).to(device)
+# In the temporal prior formula: N=no. of sampled frames from video X, K=no. of sampled frames from video Y (Used to be no. of clusters in ASOT)
+def temporal_prior(n_frames_X, n_frames_Y, rho, device):
+    temp_prior = torch.abs(torch.arange(n_frames_X)[:, None] / n_frames_X - torch.arange(n_frames_Y)[None, :] / n_frames_Y).to(device)
     return rho * temp_prior

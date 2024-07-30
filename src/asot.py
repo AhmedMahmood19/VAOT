@@ -38,7 +38,7 @@ def construct_Ca(K, r, device):
             if 1 <= abs(j - l) <= abs_r:
                 Ca[j, l] = 0
                 
-    return Ca[None,:,:]
+    return Ca
 
 
 def mult_Cv(Cv_weights, X):
@@ -56,7 +56,7 @@ def mult_Cv(Cv_weights, X):
 def grad_fgw(T, cost_matrix, alpha, Cv, Ca):
     # Shortcut for computing T*Ca, where T.shape=(B,N,K) and Ca.shape=(B,K,K) and Ca would have 0s in the diagonal and 1s everywhere else
     # T_Ca = mult_Ca(Ca, T)
-    T_Ca = T * Ca
+    T_Ca = T @ Ca
     # Returns alpha*(Cv*T*Ca) + (1-alpha)*(Ck)
     return alpha * mult_Cv(Cv, T_Ca) + (1. - alpha) * cost_matrix
 

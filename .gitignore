@@ -2,3 +2,5 @@ wandb/
 lightning_logs/
 preds/
 __pycache__/
+data
+.env

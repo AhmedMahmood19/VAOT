@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-# TODO: Not sure why they wrote Ck.T over here instead of Ca and why they did the same for T_Ck in grad_fgw()???
-# Fast implmentation of Cv @ T @ Ck.T for GW component of ASOT with O(NK) complexity
+# Fast implementation of Cv @ T @ Ca for GW component of ASOT with O(NK) complexity
 
 
 # This func creates a conv1d filter called weights, where the center frame is set to 0, and its adjacent frames(on both sides) are set to 1/r
@@ -15,48 +14,59 @@ def construct_Cv_filter(N, r, device):
     weights[abs_r] = 0.
     return weights[None, None, :]
 
-# def construct_Ca_filter(N, r, device):
-#     abs_r = int(N*r)
-#     weights = torch.zeros(2 * abs_r + 1, device=device)
-#     weights[abs_r] = 1
-#     return weights[None, None, :]
-
-# def mult_Ca(Ca_weights, X):
-#     B, N, K = X.shape
-#     X_reshaped = X.permute(0, 2, 1).reshape(-1, 1, N)
-#     Y_flat = F.conv1d(X_reshaped, Ca_weights, padding='same')
-#     Y_flat_expanded = Y_flat.view(B, K, N).permute(0, 2, 1)
-#     return Y_flat_expanded
-
-def construct_Ca(K, r, device):
-    abs_r = int(K*r)
-    
-    Ca = torch.ones((K, K), device=device)
-    
-    for j in range(K):
-        for l in range(K):
-            if 1 <= abs(j - l) <= abs_r:
-                Ca[j, l] = 0
-                
-    return Ca
-
-
+# Use conv1d as a shortcut to compute Cv * (T*Ca), using the previously created Conv1D filter Cv
 def mult_Cv(Cv_weights, X):
     # X is equivalent to T*Ca
     B, N, K = X.shape
-    # Use conv1d as a shortcut to compute Cv * (T*Ca), using the previously constructed filter Cv
-    Y_flat = F.conv1d(X.transpose(1, 2).reshape(-1, 1, N), Cv_weights, padding='same')
+    
+    # Shape = B, K, N
+    # rows become the cols and cols become the rows
+    X = X.transpose(1, 2)
+    
+    # Shape = B×K,1,N
+    # Takes the columns from each matrix across the batch elements, and combines them into a big batch of columns
+    X = X.reshape(-1, 1, N)
+
+    # The conv. filter will be applied to each column(of size N) separately, moving from top to bottom of the column while producing an output column of the same size
+    # (basically applies the filter to each row of the original input X, with padding)
+    Y_flat = F.conv1d(X, Cv_weights, padding='same')
+
+    # It reverses the reshape and transpose operations to get the same shape as the original input X
     # Returns Cv*T*Ca with the shape (B,N,K)
     return Y_flat.reshape(B, K, N).transpose(1, 2)
+
+def construct_Ca_filter(K, r, device):
+    abs_r = int(K * r)
+    weights = torch.ones((2 * abs_r) + (2 * K) + 1, device=device)
+    weights[K:K + abs_r] = 0                      # First block of abs_r zeros
+    weights[K + abs_r + 1:K + 2 * abs_r + 1] = 0  # Second block of abs_r zeros
+    return weights[None, None, :]
+
+# Use conv1d as a shortcut to compute T * Ca, using the previously created Conv1D filter Ca
+def mult_Ca(Ca_weights, X):
+    # X is equivalent to T
+    B, N, K = X.shape
+
+    # Shape = B×N,1,K
+    # Takes the columns from each matrix across the batch elements, and combines them into a big batch of columns  
+    X = X.reshape(-1, 1, K)
+
+    # The conv. filter will be applied to each column(of size K) separately, moving from top to bottom of the column while producing an output column of the same size
+    # (basically applies the filter to each column of the original input X, with padding)
+    # NOTE: Moving X and Ca_weights to cpu or changing their dtype to float64 gives the exact same result as matrix multiplication
+    Y_flat = F.conv1d(X, Ca_weights, padding=(Ca_weights.size(-1) - 1) // 2)
+
+    # It reverses the reshape operation to get the same shape as the original input X
+    # Returns T*Ca with the shape (B,N,K)
+    return Y_flat.reshape(B, N, K)
 
 
 # ASOT objective function gradients for mirro descent solver
 
 # NOTE: This is used to compute the FGW objective from eq (3), as well as to compute the gradient or derivative of eq (3) w.r.t. T  
 def grad_fgw(T, cost_matrix, alpha, Cv, Ca):
-    # Shortcut for computing T*Ca, where T.shape=(B,N,K) and Ca.shape=(B,K,K) and Ca would have 0s in the diagonal and 1s everywhere else
-    # T_Ca = mult_Ca(Ca, T)
-    T_Ca = T @ Ca
+    # Calculate T*Ca
+    T_Ca = mult_Ca(Ca, T)
     # Returns alpha*(Cv*T*Ca) + (1-alpha)*(Ck)
     return alpha * mult_Cv(Cv, T_Ca) + (1. - alpha) * cost_matrix
 
@@ -126,18 +136,19 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
     ## FGW stuff    
     # NOTE: Read my comments in construct_Cv_filter() and grad_fgw() for more clarity
     # These steps are an efficient way to compute the FGW objective, eq (3) from ASOT
-    # 1. Cv is a Conv1d filter(we don't explicitly compute Cv and Ca)
+    # 1. Cv and Ca are Conv1d filters(we don't explicitly compute them as matrices)
     # 2. Compute grad_fgw = alpha*(Cv*T*Ca) + (1-alpha)*(Ck)
     # 3. Element-wise multiply it with T
     # 4. Finally, sum all the elements in each batch element, to get a single value(fgw_obj) per batch element
     # (Steps 3 and 4 are a shortcut to compute the 2 dot/inner products with T, apply alpha weights, and add them)
     # fgw_obj = (alpha)*<Cv*T*Ca, T> + (1-alpha)*<Ck, T>
     Cv = construct_Cv_filter(N, radius, dev)
-    Ca = construct_Ca(K, radius, dev)
+    Ca = construct_Ca_filter(K, radius, dev)
+
     fgw_obj = (grad_fgw(T_mask, cost_matrix, alpha, Cv, Ca) * T_mask).sum(dim=(1, 2))
     
-    # Unbalanced stuff
-    # TODO: The code until just before entr is for the KLD in eq (4), might have to remove this for a Balanced OT
+    # Unbalanced stuff (if ub_frames or ub_actions are True)
+    # The code from here till right before entr is for the KLD term in eq (4)
     dy = torch.ones((B, K), device=dev) / nnz_Y[:, None]
     dx = torch.ones((B, N), device=dev) / nnz_X[:, None]
     
@@ -146,7 +157,9 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
     actions_marg = T_mask.sum(dim=1)
     actions_ub_penalty = kld(actions_marg, dy) * lambda_actions
     
+    # The KLD term(ub) of eq(4) is initially 0, this would be the value used for balanced OT
     ub = torch.zeros(B, device=dev)
+    # But if either of the 2 flags below are True then it becomes an unbalanced OT and ub is modified
     if ub_frames:
         ub += frames_ub_penalty
     if ub_actions:
@@ -203,7 +216,8 @@ def segment_asot(cost_matrix, mask_X=None, mask_Y=None, eps=0.07, alpha=0.3, rad
     
     # Read comments in the function definition
     Cv = construct_Cv_filter(N, radius, dev)
-    Ca = construct_Ca(K, radius, dev)
+    Ca = construct_Ca_filter(K, radius, dev)
+
     # the trace stores all of the computed objs(transportation costs)
     obj_trace = []
     # Iteration number for the outer loop
@@ -238,7 +252,7 @@ def segment_asot(cost_matrix, mask_X=None, mask_Y=None, eps=0.07, alpha=0.3, rad
         # Update T like you'd update weights in gradient descent 
         T = T * torch.exp(-step_size * grad_obj)
         
-        # TODO: Might have to use this condition if we want it to be balanced, thus both would be False
+        # 1st condition is used for the balanced OT, the other 2 conditions are for unbalanced OT
         if not ub_frames and not ub_actions:
             T = project_to_polytope_KL(fgw_cost_matrix, mask_X, mask_Y, eps, dx, dy,
                                        n_iters=n_iters[1], stable_thres=stable_thres)

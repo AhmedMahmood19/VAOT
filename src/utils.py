@@ -1,5 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+
+import pytorch_lightning as pl
 
 from scipy.spatial.distance import pdist, squareform
 
@@ -137,3 +140,43 @@ def plot_matrix(mat, gt=None, colorbar=True, title=None, figsize=(10, 5), ylabel
     ax.set_aspect('auto')
     fig.tight_layout()
     return fig
+
+class CheckpointEveryNSteps(pl.Callback):
+    """
+    Save a checkpoint every N steps, instead of Lightning's default that checkpoints
+    based on validation loss.
+    """
+
+    def __init__(
+        self,
+        save_step_frequency,
+        filepath,
+        prefix="model",
+        use_modelcheckpoint_filename=False,
+    ):
+        """
+        Args:
+            save_step_frequency: how often to save in steps
+            prefix: add a prefix to the name, only used if
+                use_modelcheckpoint_filename=False
+            use_modelcheckpoint_filename: just use the ModelCheckpoint callback's
+                default filename, don't use ours.
+        """
+        self.save_step_frequency = save_step_frequency
+        self.prefix = prefix
+        self.filepath = filepath
+        self.use_modelcheckpoint_filename = use_modelcheckpoint_filename
+
+        os.makedirs(self.filepath, exist_ok=True)
+
+    def on_batch_end(self, trainer: pl.Trainer, _):
+        """ Check if we should save a checkpoint after every train batch """
+        epoch = trainer.current_epoch
+        global_step = trainer.global_step
+        if global_step % self.save_step_frequency == 0:
+            if self.use_modelcheckpoint_filename:
+                filename = trainer.checkpoint_callback.filename
+            else:
+                filename = f"{self.prefix}lAV_epoch={epoch}_step={global_step}.ckpt"
+            ckpt_path = os.path.join(self.filepath, filename)
+            trainer.save_checkpoint(ckpt_path)

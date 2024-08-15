@@ -56,9 +56,12 @@ class VideoDataset(Dataset):
         if granularity is None:  # granularity applies only to 50Salads
             # Apply prep() to each line in the file to convert each line into a tuple (action-class, action-id), store a list of tuples
             action_mapping = list(map(prep, open(path.join(self.data_dir, 'mapping/mapping.txt'))))
+
         else:
             action_mapping = list(map(prep, open(path.join(self.data_dir, f'mapping/mapping{granularity}.txt'))))
+
         self.action_mapping = dict(action_mapping)
+
         self.n_subactions = len(set(self.action_mapping.keys()))
         self.n_frames = n_frames
         self.standardise = standardise
@@ -153,3 +156,7 @@ class VideoDataset(Dataset):
             mask = np.concatenate((np.full(n_frames, 1, dtype=bool), np.zeros(n_samples - n_frames, dtype=bool)))
         
         return indices, mask
+
+    def get_action_name(self, idx):
+        names = list(self.action_mapping.keys())
+        return names[idx]

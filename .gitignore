@@ -4,3 +4,6 @@ preds/
 __pycache__/
 data
 .env
+src/checkpoints
+src/log
+.vscode

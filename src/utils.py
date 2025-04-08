@@ -40,14 +40,14 @@ def plot_segmentation_gt(gt, pred, mask, gt_uniq=None, pred_to_gt=None, exclude_
         else:
             colors[label] = cmap(i / n_class)
 
-    fig = plt.figure(figsize=(16, 4))
+    fig = plt.figure(figsize=(20, 4))
     plt.axis('off')
     plt.title(name, fontsize=45, pad=20)
 
     # plot gt segmentation
 
     ax = fig.add_subplot(2, 1, 1)
-    ax.set_ylabel('GT', fontsize=45, rotation=0, labelpad=40, verticalalignment='center')
+    ax.set_ylabel('Ground Truth', fontsize=40, rotation=0, labelpad=140, verticalalignment='center')
     ax.set_yticklabels([])
     ax.set_xticklabels([])
 
@@ -63,7 +63,8 @@ def plot_segmentation_gt(gt, pred, mask, gt_uniq=None, pred_to_gt=None, exclude_
     # plot predicted segmentation after matching to gt labels w/Hungarian
 
     ax = fig.add_subplot(2, 1, 2)
-    ax.set_ylabel('Ours', fontsize=45, rotation=0, labelpad=60, verticalalignment='center')
+    ax.set_ylabel('VASOT (Ours)', fontsize=40, rotation=0, labelpad=140, verticalalignment='center')
+    # ax.yaxis.set_label_coords(-0.1, 0.5)
     ax.set_yticklabels([])
     ax.set_xticklabels([])
 
@@ -94,7 +95,7 @@ def plot_segmentation(pred, mask, name=''):
         else:
             colors[label] = cmap(i / len(uniq))
 
-    fig = plt.figure(figsize=(16, 2))
+    fig = plt.figure(figsize=(23, 2))
     plt.axis('off')
     plt.title(name, fontsize=30, pad=20)
 

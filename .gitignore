@@ -4,3 +4,5 @@ preds/
 __pycache__/
 data
 .env
+.venv
+data2
